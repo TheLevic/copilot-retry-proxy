@@ -14,6 +14,9 @@ OpenAI-compatible API that rate-limits you.
   instead of after one. Under the budget, requests pass straight through.
 - If VS Code cancels a request while it is waiting, the request is dropped
   instead of spending tokens on an answer nobody will read.
+- A chat response that ends without any choices (an empty answer, or an error
+  tucked inside a 200) is retried too. Only the start of the response is held
+  back, until the first choice arrives, so this adds no visible delay.
 - Streams successful (SSE) responses straight through.
 - Appends one line per chat request (token counts only, never prompt text) to
   a CSV usage log.
@@ -24,7 +27,8 @@ Usage:
 Optional env vars: TOKEN_BUDGET (0 = no pacing), MAX_RETRIES (8),
   MAX_WAIT (60s cap per wait), MIN_WAIT (0s floor per retry wait), PORT (8765),
   USAGE_LOG (~/.local/state/copilot-retry-proxy/usage.csv, "" to disable),
-  LOG_FILE (~/.local/state/copilot-retry-proxy/proxy.log, "" to disable)
+  LOG_FILE (~/.local/state/copilot-retry-proxy/proxy.log, "" to disable),
+  EMPTY_RETRIES (2 retries for empty, non-rate-limit answers)
 Then change the Custom Endpoint URL in chatLanguageModels.json from
   https://<your-llm-host>/v1/chat/completions
 to
@@ -49,6 +53,7 @@ PORT = int(os.environ.get("PORT", "8765"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "8"))
 MAX_WAIT = float(os.environ.get("MAX_WAIT", "60"))
 MIN_WAIT = float(os.environ.get("MIN_WAIT", "0"))  # floor for every retry wait
+EMPTY_RETRIES = int(os.environ.get("EMPTY_RETRIES", "2"))  # each one resends the whole prompt
 TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "0"))  # tokens per WINDOW; 0 = no pacing
 USAGE_LOG = os.path.expanduser(
     os.environ.get("USAGE_LOG", "~/.local/state/copilot-retry-proxy/usage.csv"))
@@ -66,6 +71,9 @@ RETRY_RE = re.compile(rb'"retry_after(?:_seconds)?"\s*:\s*([\d.]+)')
 MODEL_RE = re.compile(rb'"model"\s*:\s*"([^"]*)"')
 PROMPT_RE = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
 COMPLETION_RE = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
+CHOICE_RE = re.compile(rb'"choices"\s*:\s*\[\s*\{')
+RATE_LIMITED_RE = re.compile(rb'rate.?limit|"code"\s*:\s*"?429|retry_after', re.I)
+PEEK_MAX = 1 << 20  # never hold back more than this while looking for the first choice
 USAGE_HEADER = "time,model,status,prompt_tokens,completion_tokens,est_tokens,retries,waited_s,total_s\n"
 UPSTREAM_ERRORS = (OSError, http.client.HTTPException)
 
@@ -219,6 +227,8 @@ class Proxy(BaseHTTPRequestHandler):
         """Forward with retries; returns (status, usage) for the usage log."""
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
         url = UPSTREAM + self.path
+        expect_choices = self.command == "POST" and "/chat/completions" in self.path
+        empties = 0
 
         for attempt in range(MAX_RETRIES + 1):
             gate = cooldown_remaining()
@@ -227,6 +237,7 @@ class Proxy(BaseHTTPRequestHandler):
             req = urllib.request.Request(url, data=body, headers=headers, method=self.command)
             try:
                 resp = urllib.request.urlopen(req, timeout=600)
+                head, ended = self.read_until_choice(resp) if expect_choices else (b"", False)
             except urllib.error.HTTPError as e:
                 err_body = e.read()
                 if e.code in RETRY_CODES and attempt < MAX_RETRIES:
@@ -250,8 +261,43 @@ class Proxy(BaseHTTPRequestHandler):
                     continue
                 self.relay_body(502, None, f"proxy: upstream unreachable: {e!r}".encode())
                 return "unreachable", None
+            if ended and not CHOICE_RE.search(head):
+                resp.close()
+                limited = bool(RATE_LIMITED_RE.search(head))
+                snippet = head[:300].decode(errors="replace").replace("\n", " ")
+                if attempt < MAX_RETRIES and (limited or empties < EMPTY_RETRIES):
+                    empties += not limited
+                    w = wait_seconds(resp.headers, head, attempt)
+                    log(f"{resp.status} with no choices ({snippet!r}), "
+                        f"retry {attempt + 1}/{MAX_RETRIES} in {w:.1f}s")
+                    self.retries += 1
+                    if limited:
+                        set_cooldown(w)
+                    else:
+                        self.pause(w)
+                    continue
+                log(f"{resp.status} with no choices ({snippet!r}), giving up")
+                self.relay_body(resp.status, resp.headers, head)
+                return "no-choices", parse_usage(head)
             # Outside the try: once headers go out to VS Code we must never retry.
-            return self.relay_stream(resp)
+            return self.relay_stream(resp, head)
+
+    def read_until_choice(self, resp):
+        """Hold back the start of a chat response until it contains a choice, so an
+        empty or error-only 200 can still be retried. VS Code has nothing to show
+        before the first choice anyway. Returns (bytes read, whether it ended)."""
+        head = b""
+        while len(head) < PEEK_MAX:
+            chunk = resp.read1(65536)
+            if not chunk:
+                if resp.length:  # upstream closed before sending its full Content-Length
+                    raise http.client.IncompleteRead(head, resp.length)
+                return head, True
+            start = max(0, len(head) - 64)  # a match may straddle two chunks
+            head += chunk
+            if CHOICE_RE.search(head, start):
+                return head, False
+        return head, False
 
     def pause(self, seconds):
         """Sleep in short steps; raise ClientGone if VS Code hangs up meanwhile."""
@@ -286,20 +332,25 @@ class Proxy(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def relay_stream(self, resp):
+    def write_chunk(self, data):
+        self.wfile.write(b"%X\r\n%s\r\n" % (len(data), data))
+        self.wfile.flush()
+
+    def relay_stream(self, resp, head=b""):
         self.streamed = True
         self.send_response(resp.status)
         self.send_upstream_headers(resp.headers)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        status, tail = str(resp.status), b""
+        status, tail = str(resp.status), head[-16384:]
         try:
+            if head:
+                self.write_chunk(head)
             while True:
                 chunk = resp.read1(65536)
                 if not chunk:
                     break
-                self.wfile.write(b"%X\r\n%s\r\n" % (len(chunk), chunk))
-                self.wfile.flush()
+                self.write_chunk(chunk)
                 tail = (tail + chunk)[-16384:]  # usage arrives in the last chunk
             if resp.length:  # upstream closed before sending its full Content-Length
                 raise http.client.IncompleteRead(b"", resp.length)

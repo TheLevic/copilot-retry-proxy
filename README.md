@@ -19,6 +19,10 @@ VS Code Copilot Chat  ──►  127.0.0.1:8765 (this proxy)  ──►  your LL
 - **Shared cooldown.** A 429 on one request pauses every in-flight request, and each one
   adds a little jitter when it resumes. Copilot's parallel requests don't all
   hit the limit again the moment the wait ends.
+- **Retries empty answers.** If a chat response ends with no choices (an empty answer,
+  or an error tucked inside a `200`), it is retried instead of showing up as
+  *"Response contained no choices"*. Only the start of the response is held back, until
+  the first choice arrives, so answers don't start any later.
 - **Respects cancel.** If you stop a request in VS Code while it is waiting, it is dropped,
   so you don't spend tokens on an answer nobody will read.
 - **Streams responses** (SSE) straight through. If the upstream dies mid-stream, VS Code
@@ -69,6 +73,7 @@ set it in the unit file (there's a commented line for it).
 | `MIN_WAIT`     | `0`     | Minimum seconds per retry wait (e.g. `15`) |
 | `MAX_WAIT`     | `60`    | Maximum seconds per retry wait |
 | `MAX_RETRIES`  | `8`     | Retries before the error is passed to VS Code |
+| `EMPTY_RETRIES`| `2`     | Retries for empty answers that aren't rate limits (each one resends the whole prompt) |
 | `PORT`         | `8765`  | Local port to listen on |
 | `USAGE_LOG`    | `~/.local/state/copilot-retry-proxy/usage.csv` | Usage CSV; set to an empty value to disable |
 | `LOG_FILE`     | `~/.local/state/copilot-retry-proxy/proxy.log` | Retry/pacing log (same as console); rotated to `.1` at 5 MB |
