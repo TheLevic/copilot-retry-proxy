@@ -1,0 +1,17 @@
+[Unit]
+Description=Auto-retry proxy for VS Code Copilot custom endpoints
+After=network-online.target
+
+[Service]
+# Edit these, then: systemctl --user daemon-reload && systemctl --user restart copilot-retry-proxy
+Environment=UPSTREAM=https://your-llm-host
+Environment=TOKEN_BUDGET=1400000
+Environment=MIN_WAIT=15
+# Services don't inherit your shell's environment. If you need a corporate proxy, set it here:
+# Environment=HTTPS_PROXY=http://proxy.example:8080
+ExecStart=/usr/bin/env python3 %h/copilot-retry-proxy/copilot_retry_proxy.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
