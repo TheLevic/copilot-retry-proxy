@@ -54,7 +54,7 @@ cp ~/copilot-retry-proxy/copilot-retry-proxy.service ~/.config/systemd/user/
 # edit UPSTREAM (and TOKEN_BUDGET) in ~/.config/systemd/user/copilot-retry-proxy.service
 systemctl --user daemon-reload
 systemctl --user enable --now copilot-retry-proxy
-journalctl --user -u copilot-retry-proxy -f   # watch retries / pacing
+tail -f ~/.local/state/copilot-retry-proxy/proxy.log   # watch retries / pacing
 ```
 
 A service does not inherit your shell's environment. If your network needs `HTTPS_PROXY`,
@@ -71,6 +71,7 @@ set it in the unit file (there's a commented line for it).
 | `MAX_RETRIES`  | `8`     | Retries before the error is passed to VS Code |
 | `PORT`         | `8765`  | Local port to listen on |
 | `USAGE_LOG`    | `~/.local/state/copilot-retry-proxy/usage.csv` | Usage CSV; set to an empty value to disable |
+| `LOG_FILE`     | `~/.local/state/copilot-retry-proxy/proxy.log` | Retry/pacing log (same as console); rotated to `.1` at 5 MB |
 
 **How pacing counts tokens:** a request is first estimated at body size ÷ 4. When the response
 includes a `usage` block, that estimate is replaced with the real prompt + completion count.

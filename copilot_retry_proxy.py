@@ -23,7 +23,8 @@ Usage:
   UPSTREAM="https://<your-llm-host>" TOKEN_BUDGET=1400000 python3 copilot_retry_proxy.py
 Optional env vars: TOKEN_BUDGET (0 = no pacing), MAX_RETRIES (8),
   MAX_WAIT (60s cap per wait), MIN_WAIT (0s floor per retry wait), PORT (8765),
-  USAGE_LOG (~/.local/state/copilot-retry-proxy/usage.csv, "" to disable)
+  USAGE_LOG (~/.local/state/copilot-retry-proxy/usage.csv, "" to disable),
+  LOG_FILE (~/.local/state/copilot-retry-proxy/proxy.log, "" to disable)
 Then change the Custom Endpoint URL in chatLanguageModels.json from
   https://<your-llm-host>/v1/chat/completions
 to
@@ -51,6 +52,9 @@ MIN_WAIT = float(os.environ.get("MIN_WAIT", "0"))  # floor for every retry wait
 TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "0"))  # tokens per WINDOW; 0 = no pacing
 USAGE_LOG = os.path.expanduser(
     os.environ.get("USAGE_LOG", "~/.local/state/copilot-retry-proxy/usage.csv"))
+LOG_FILE = os.path.expanduser(  # same lines as the console, for when journalctl isn't available
+    os.environ.get("LOG_FILE", "~/.local/state/copilot-retry-proxy/proxy.log"))
+LOG_MAX_BYTES = 5_000_000  # rotated to .1 at startup once it gets this big
 WINDOW = 60.0
 JITTER = 3.0  # spread out requests released from a shared cooldown
 RETRY_CODES = {429, 500, 502, 503, 504}
@@ -68,6 +72,7 @@ UPSTREAM_ERRORS = (OSError, http.client.HTTPException)
 _cooldown_lock = threading.Lock()
 _cooldown_until = 0.0  # time.monotonic() before which nobody calls upstream
 _usage_lock = threading.Lock()
+_log_lock = threading.Lock()
 
 
 class ClientGone(Exception):
@@ -103,7 +108,14 @@ BUDGET = TokenBudget(TOKEN_BUDGET) if TOKEN_BUDGET > 0 else None
 
 
 def log(msg):
-    print(time.strftime("%H:%M:%S"), msg, file=sys.stderr, flush=True)
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    print(line, file=sys.stderr, flush=True)
+    if LOG_FILE:
+        try:
+            with _log_lock, open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass  # the console still has it
 
 
 def set_cooldown(seconds):
@@ -314,11 +326,17 @@ class Proxy(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not UPSTREAM:
         sys.exit("Set UPSTREAM to your API base URL, e.g. UPSTREAM=https://host python3 copilot_retry_proxy.py")
-    if USAGE_LOG:
-        try:
-            os.makedirs(os.path.dirname(USAGE_LOG) or ".", exist_ok=True)
-        except OSError as e:
-            log(f"can't create usage log dir ({e})")
+    for path in (LOG_FILE, USAGE_LOG):
+        if path:
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            except OSError as e:
+                print(f"can't create log dir for {path} ({e})", file=sys.stderr)
+    try:
+        if LOG_FILE and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+    except OSError:
+        pass  # no log yet
     pacing = f"pacing to {TOKEN_BUDGET} tokens/min" if BUDGET else "no pacing (set TOKEN_BUDGET)"
     log(f"retry proxy on http://127.0.0.1:{PORT} -> {UPSTREAM}, {pacing}")
     try:
